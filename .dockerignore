@@ -1,0 +1,6 @@
+**/target
+**/.git
+.git
+Capturas_S6
+docs
+*.md

@@ -1,0 +1,16 @@
+server:
+  port: 9000
+
+spring:
+  application:
+    name: auth-server
+
+seguridad:
+  # Issuer de los tokens emitidos (claim iss). En Docker se inyecta
+  # AUTH_SERVER_ISSUER=http://auth-server:9000 para que los Resource Servers
+  # de la red interna validen el mismo issuer.
+  issuer: ${AUTH_SERVER_ISSUER:http://localhost:9000}
+  # Clientes OAuth2 registrados: client-id:secret:SCOPE1,SCOPE2 separados por
+  # punto y coma. Son los microservicios del ecosistema (contexto academico).
+  clientes: ${OAUTH_CLIENTES:ms-cuentas:cuentas-secret-123:CONSULTA,REPORTES;ms-transacciones:transacciones-secret-456:CONSULTA,REPORTES;ms-operaciones:operaciones-secret-789:CONSULTA,RETIRO,REPORTES,INTERNO}
+  token-expiracion-minutos: 30

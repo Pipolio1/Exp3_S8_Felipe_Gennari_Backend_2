@@ -1,0 +1,217 @@
+# Orquestacion completa del ecosistema bancario (Banco XYZ) para un entorno Cloud.
+# Un solo comando levanta toda la plataforma:  docker compose up -d --build
+#
+# Componentes:
+#   mysql            base legada bank_legacy (se inicializa con scripts/sql)
+#   kafka + kafka-ui mensajeria asincrona (topico retiros-realizados)
+#   config-server    configuracion centralizada (8888)
+#   eureka-server    service discovery (8761)
+#   auth-server      Authorization Server OAuth2 (9000)
+#   ms-cuentas       dueno del saldo (8081)
+#   ms-transacciones historial (8082)
+#   ms-operaciones   orquestador del retiro (8083)
+#
+# Nota: si existe el contenedor local mysql-bank de semanas anteriores,
+# detenerlo antes (docker stop mysql-bank) porque usa el mismo puerto 3306.
+
+networks:
+  bank-net:
+
+volumes:
+  mysql-data:
+  kafka-data:
+
+services:
+
+  # ---------- Infraestructura ----------
+
+  mysql:
+    image: mysql:8
+    container_name: mysql-bank-compose
+    networks: [bank-net]
+    ports:
+      - "3306:3306"
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: bank_legacy
+    # Los .sql de esta carpeta se ejecutan en orden alfabetico la primera vez
+    # (bank_legacy.sql con los datos legados, luego eventos_procesados.sql)
+    volumes:
+      - mysql-data:/var/lib/mysql
+      - ./scripts/sql:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-proot"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  kafka:
+    image: apache/kafka:3.9.0
+    container_name: kafka-bank
+    networks: [bank-net]
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_LISTENERS: PLAINTEXT://:9092,PLAINTEXT_INTERNAL://:29092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092,PLAINTEXT_INTERNAL://kafka:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_INTERNAL:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: kafka-ui-bank
+    networks: [bank-net]
+    depends_on:
+      - kafka
+    ports:
+      - "8090:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: bank-local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
+
+  # ---------- Plataforma Spring Cloud ----------
+
+  config-server:
+    build:
+      context: .
+      dockerfile: config-server/Dockerfile
+    container_name: config-server
+    networks: [bank-net]
+    ports:
+      - "8888:8888"
+
+  eureka-server:
+    build:
+      context: .
+      dockerfile: eureka-server/Dockerfile
+    container_name: eureka-server
+    networks: [bank-net]
+    ports:
+      - "8761:8761"
+
+  auth-server:
+    build:
+      context: .
+      dockerfile: auth-server/Dockerfile
+    container_name: auth-server
+    networks: [bank-net]
+    ports:
+      - "9000:9000"
+    environment:
+      # Issuer interno de la red Docker: los Resource Servers validan el claim
+      # iss contra esta misma URL (AUTH_SERVER_ISSUER en cada microservicio)
+      AUTH_SERVER_ISSUER: http://auth-server:9000
+
+  # ---------- Microservicios de negocio ----------
+
+  ms-cuentas:
+    build:
+      context: .
+      dockerfile: ms-cuentas/Dockerfile
+    container_name: ms-cuentas
+    networks: [bank-net]
+    depends_on:
+      mysql:
+        condition: service_healthy
+      kafka:
+        condition: service_started
+      config-server:
+        condition: service_started
+      eureka-server:
+        condition: service_started
+      auth-server:
+        condition: service_started
+    environment:
+      CONFIG_SERVER_URL: http://config-server:8888
+      EUREKA_URL: http://eureka-server:8761/eureka/
+      DB_HOST: mysql
+      KAFKA_BOOTSTRAP: kafka:29092
+      AUTH_SERVER_URL: http://auth-server:9000
+      AUTH_SERVER_ISSUER: http://auth-server:9000
+    ports:
+      - "8081:8081"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/localhost/8081' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 60s
+
+  ms-transacciones:
+    build:
+      context: .
+      dockerfile: ms-transacciones/Dockerfile
+    container_name: ms-transacciones
+    networks: [bank-net]
+    depends_on:
+      mysql:
+        condition: service_healthy
+      kafka:
+        condition: service_started
+      config-server:
+        condition: service_started
+      eureka-server:
+        condition: service_started
+      auth-server:
+        condition: service_started
+    environment:
+      CONFIG_SERVER_URL: http://config-server:8888
+      EUREKA_URL: http://eureka-server:8761/eureka/
+      DB_HOST: mysql
+      KAFKA_BOOTSTRAP: kafka:29092
+      AUTH_SERVER_URL: http://auth-server:9000
+      AUTH_SERVER_ISSUER: http://auth-server:9000
+    ports:
+      - "8082:8082"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/localhost/8082' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 60s
+
+  ms-operaciones:
+    build:
+      context: .
+      dockerfile: ms-operaciones/Dockerfile
+    container_name: ms-operaciones
+    networks: [bank-net]
+    depends_on:
+      mysql:
+        condition: service_healthy
+      kafka:
+        condition: service_started
+      config-server:
+        condition: service_started
+      eureka-server:
+        condition: service_started
+      auth-server:
+        condition: service_started
+    environment:
+      CONFIG_SERVER_URL: http://config-server:8888
+      EUREKA_URL: http://eureka-server:8761/eureka/
+      DB_HOST: mysql
+      KAFKA_BOOTSTRAP: kafka:29092
+      AUTH_SERVER_URL: http://auth-server:9000
+      AUTH_SERVER_ISSUER: http://auth-server:9000
+    ports:
+      - "8083:8083"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/localhost/8083' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 60s
